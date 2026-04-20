@@ -92,10 +92,14 @@ def main():
 
         # Compute R2 score on validation set
         streams_r2 = compute_R2(valid_loader, model, args.device)
-        str_r2 = " ".join([f"{name}: {r2:.4f}" for name, r2 in streams_r2.items()])
+        str_r2 = " | ".join([f"{name}: {r2:.4f}" for name, r2 in streams_r2.items()])
+
+        dead_features = model.get_dead_features()
+        str_dead = " | ".join(f"{name}: {dead.numel()/model.latent_dim:.2%}" for name, dead in dead_features.items())
+
         print(f"Epoch {epoch+1}/{args.num_epochs} - Loss: {epoch_loss:.4f} Cross Loss: {sum(cross_loss.values()):.4f} Self Loss: {sum(self_loss.values()):.4f}")
         print(f"Validation R2 scores: {str_r2}")
-    
+        print("Dead Features:", str_dead)
     if args.save_path is not None:
         torch.save(model.state_dict(), args.save_path)
         print(f"Model saved to {args.save_path}")

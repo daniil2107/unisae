@@ -56,6 +56,8 @@ class SPARC(nn.Module):
             self.pre_biases[name] = nn.Parameter(torch.zeros(dim))
             self.latent_biases[name] = nn.Parameter(torch.zeros(latent_dim))
 
+            self.register_buffer(f'last_non_zero_{name}', torch.zeros(latent_dim))
+
     def _encode_stream(self, x : torch.Tensor, name: str):
         centered_x = x - self.pre_biases[name]
         return F.linear(centered_x, self.encoders[name].weight, self.latent_biases[name])
@@ -77,6 +79,15 @@ class SPARC(nn.Module):
         outputs = {}
         for name in inputs.keys():
             streams_z[name] = streams_enc[name] * shared_mask  # [B, D]
+
+            stream_non_zero = getattr(self, f'last_non_zero_{name}')
+            # Update non-zero tracking
+            activated_mask_batch = (streams_z[name] > 1e-5)
+            activated_mask_latent = activated_mask_batch.any(dim=0).float()  # [D]
+            stream_non_zero *= (1 - activated_mask_latent)
+            stream_non_zero += 1
+
+
             outputs[name] = self._decode_stream(streams_z[name], name)
 
         for name_z in inputs.keys():
@@ -87,3 +98,10 @@ class SPARC(nn.Module):
                     outputs["cross_" + name_z + "_from_" + name_dec] = cross_decoded
 
         return outputs, streams_z
+
+    def get_dead_features(self, threshold: int = 100):
+        dead_features = {}
+        for name in self.streams_dim.keys():
+            stream_non_zero = getattr(self, f'last_non_zero_{name}')
+            dead_features[name] = (stream_non_zero >= threshold).nonzero(as_tuple=True)[0]
+        return dead_features
