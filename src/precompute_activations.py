@@ -266,10 +266,21 @@ class ActivationExtractor:
 
     @staticmethod
     def _load_model(model_name: str, device: str) -> HookedTransformer:
+        from transformers import AutoTokenizer
         logging.info("Loading model: %s", model_name)
+        # Some tokenizers (e.g., Qwen2/2.5) ship configs that trip newer
+        # transformers' strict validation when HookedTransformer loads them
+        # with default args ("add_bos_token = True but bos_token = None").
+        # Pre-loading with add_bos_token=False sidesteps it. We prepend BOS
+        # ourselves at the encode site, so this is safe for all models.
+        try:
+            tokenizer = AutoTokenizer.from_pretrained(model_name, add_bos_token=False)
+        except Exception:
+            tokenizer = None
         model = HookedTransformer.from_pretrained(
             model_name,
             device=device,
+            tokenizer=tokenizer,
         )
         model.eval()
         for p in model.parameters():

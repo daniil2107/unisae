@@ -15,13 +15,15 @@ from torch.utils.data import BatchSampler, DataLoader, Dataset
 @dataclass
 class StoreConfig:
     root: Path
-    hook_point: str
     dtype: str
     token_dtype: str
-    sequence_length: int
     batch_size: int
     shard_size_tokens: int
     models: List[dict]
+    alignment_mode: str = "none"                    # "none" (shared tokenizer) or "greedy" (aligned)
+    hook_point: Optional[str] = None                # present only when alignment_mode == "none"
+    sequence_length: Optional[int] = None           # present only when alignment_mode == "none"
+    primary_sequence_length: Optional[int] = None   # present only when alignment_mode == "greedy"
 
 
 @dataclass
@@ -39,13 +41,15 @@ def load_store_config(root: str | Path) -> StoreConfig:
         cfg = json.load(f)
     return StoreConfig(
         root=root,
-        hook_point=cfg["hook_point"],
         dtype=cfg["dtype"],
         token_dtype=cfg["token_dtype"],
-        sequence_length=cfg["sequence_length"],
         batch_size=cfg["batch_size"],
         shard_size_tokens=cfg["shard_size_tokens"],
         models=cfg["models"],
+        alignment_mode=cfg.get("alignment_mode", "none"),
+        hook_point=cfg.get("hook_point"),
+        sequence_length=cfg.get("sequence_length"),
+        primary_sequence_length=cfg.get("primary_sequence_length"),
     )
 
 
@@ -73,20 +77,25 @@ class _LazyShardCache:
     """
     Per-worker lazy memmap cache.
     Keeps only the currently needed shard open.
+
+    In alignment_mode == "none", a single `tokens.npy` is loaded per shard.
+    In alignment_mode == "greedy", per-model `last_tok_{slug}.npy` is loaded.
     """
 
     def __init__(self, store_cfg: StoreConfig):
         self.store_cfg = store_cfg
         self.current_shard_index: Optional[int] = None
         self.tokens_mm = None
+        self.tokens_mms: Dict[str, np.memmap] = {}
         self.act_mms: Dict[str, np.memmap] = {}
 
     def open_shard(self, shard: ShardRecord):
         if self.current_shard_index == shard.shard_index:
             return
 
-        self.tokens_mm = np.load(shard.path / "tokens.npy", mmap_mode="r")
         self.act_mms = {}
+        self.tokens_mms = {}
+        self.tokens_mm = None
         for model in self.store_cfg.models:
             model_name = model["name"]
             slug = model["slug"]
@@ -95,12 +104,24 @@ class _LazyShardCache:
                 mmap_mode="r",
             )
 
+        if self.store_cfg.alignment_mode == "greedy":
+            for model in self.store_cfg.models:
+                self.tokens_mms[model["name"]] = np.load(
+                    shard.path / f"last_tok_{model['slug']}.npy",
+                    mmap_mode="r",
+                )
+        else:
+            self.tokens_mm = np.load(shard.path / "tokens.npy", mmap_mode="r")
+
         self.current_shard_index = shard.shard_index
 
     def read_range(self, shard: ShardRecord, start: int, end: int):
         self.open_shard(shard)
-        tokens = self.tokens_mm[start:end]
         activations = {name: mm[start:end] for name, mm in self.act_mms.items()}
+        if self.store_cfg.alignment_mode == "greedy":
+            tokens = {name: mm[start:end] for name, mm in self.tokens_mms.items()}
+        else:
+            tokens = self.tokens_mm[start:end]
         return tokens, activations
 
 
@@ -175,10 +196,15 @@ class AlignedActivationDataset(Dataset):
         shard, local_idx = self._locate(index)
         tokens_np, acts_np = self._cache.read_range(shard, local_idx, local_idx + 1)
 
-        item = {
-            "tokens": torch.from_numpy(np.asarray(tokens_np, dtype=np.int64).copy()),
-            "activations": {},
-        }
+        item: dict = {"activations": {}}
+        if isinstance(tokens_np, dict):
+            # aligned mode: per-model last-token ids
+            item["tokens"] = {
+                name: torch.from_numpy(np.asarray(toks, dtype=np.int64).copy())
+                for name, toks in tokens_np.items()
+            }
+        else:
+            item["tokens"] = torch.from_numpy(np.asarray(tokens_np, dtype=np.int64).copy())
         for model_name in self.model_names:
             item["activations"][model_name] = torch.from_numpy(
                 np.asarray(acts_np[model_name][0]).copy()
@@ -238,18 +264,20 @@ class ShardContiguousBatchSampler(BatchSampler):
 
 
 def collate_aligned_activation_batch(batch: List[dict]) -> dict:
-    tokens = torch.cat([x["tokens"] for x in batch], dim=0)
-
-    model_names = list(batch[0]["activations"].keys())
+    first = batch[0]
+    model_names = list(first["activations"].keys())
     activations = {
         name: torch.stack([x["activations"][name] for x in batch], dim=0)
         for name in model_names
     }
-
-    return {
-        "tokens": tokens,
-        "activations": activations,
-    }
+    if isinstance(first["tokens"], dict):
+        tokens = {
+            name: torch.cat([x["tokens"][name] for x in batch], dim=0)
+            for name in first["tokens"]
+        }
+    else:
+        tokens = torch.cat([x["tokens"] for x in batch], dim=0)
+    return {"tokens": tokens, "activations": activations}
 
 
 def make_activation_dataloader(

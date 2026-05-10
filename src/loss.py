@@ -1,39 +1,31 @@
+"""Per-sample uncentered NMSE, matching SPARC's reference loss.
+
+Reference: https://github.com/AtlasAnalyticsLab/SPARC/blob/main/sparc/loss.py
+(itself adapted from OpenAI's sparse_autoencoder).
+"""
+
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
-
-from typing import Dict
 
 
+def normalized_mean_squared_error(
+    reconstruction: torch.Tensor,
+    original_input: torch.Tensor,
+) -> torch.Tensor:
+    """Per-sample uncentered NMSE.
 
-def nmse_loss(recon: torch.Tensor, target: torch.Tensor):
-    mse = F.mse_loss(recon, target)
-    var = target.var(dim=0).mean()
-    nmse = mse / (var + 1e-8)
-    return nmse
+    For each row in the batch, computes ‖r − t‖² / ‖t‖² (where ‖·‖² is the
+    mean squared element, equivalent to ‖·‖₂² up to a constant factor that
+    cancels). Returns the mean across the batch.
+    """
+    return (
+        ((reconstruction - original_input) ** 2).mean(dim=1)
+        / (original_input ** 2).mean(dim=1).clamp(min=1e-8)
+    ).mean()
 
-class SPARCLoss(nn.Module):
-    def __init__(self, recon_weight: float = 1.0, cross_recon_weight: float = 1.0):
-        super().__init__()
-        self.recon_weight = recon_weight
-        self.cross_recon_weight = cross_recon_weight
 
-    def forward(self, outputs: Dict[str, torch.Tensor], targets: Dict[str, torch.Tensor]):
-        loss = 0.0
-        total_self_loss = 0.0
-        total_cross_loss = 0.0
-        self_loss = {}
-        cross_loss = {}
-        for name in outputs.keys():
-            if name.startswith("cross_"):
-                target_name = name.split("_from_")[1]
-                l = nmse_loss(outputs[name], targets[target_name])
-                cross_loss[name] = l.item()
-                total_cross_loss += l
-            else:
-                l = nmse_loss(outputs[name], targets[name])
-                self_loss[name] = l.item()
-                total_self_loss += l
-
-        loss = self.recon_weight * total_self_loss + self.cross_recon_weight * total_cross_loss
-        return loss, self_loss, cross_loss
+def normalized_L1_loss(
+    latent_activations: torch.Tensor,
+    original_input: torch.Tensor,
+) -> torch.Tensor:
+    """Per-sample L1 norm of latents normalized by ‖input‖₂. Logged, not optimized in top-k SAEs."""
+    return (latent_activations.abs().sum(dim=1) / original_input.norm(dim=1).clamp(min=1e-8)).mean()
